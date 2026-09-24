@@ -454,7 +454,7 @@ def is_page_chrome(r: Row) -> bool:
 
 def parse(pdf_path: str | Path) -> Statement:
     doc = pymupdf.open(pdf_path)
-    st = Statement(source=str(pdf_path))
+    st = Statement(source=Path(pdf_path).name)
     section, ctx, ctx_stats = None, {}, {}
     for pno, page in enumerate(doc, start=1):
         rows = page_rows(page, pno, stats=ctx_stats)
