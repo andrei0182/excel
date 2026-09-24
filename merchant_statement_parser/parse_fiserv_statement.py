@@ -18,7 +18,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -324,7 +324,10 @@ def p_disputes(r: Row, st: Statement, ctx: dict) -> bool:
         return True
     # credits/debits banner above the table
     if all(is_money(v) or v in "-+=" or v.startswith("Total ") for v in t):
-        ctx.setdefault("banner", []).extend(money(v) for v in t if is_money(v))
+        ctx.setdefault("banner", []).extend((x, money(v)) for x, v in r.cells if is_money(v))
+        if len(ctx["banner"]) == 3:              # laid out left to right: credits - debits = net
+            credits, debits, net = (v for _, v in sorted(ctx["banner"]))
+            st.totals["disputes_banner"] = {"credits": credits, "debits": debits, "net": net}
         return True
     return False
 
@@ -341,10 +344,15 @@ def p_fee_summary(r: Row, st: Statement, ctx: dict) -> bool:
         else:
             st.fee_summary.append({"fee_type": t[0], **vals})
         return True
-    # donut chart above the table: headline labels, numbers & percentages
-    if "brands" not in ctx or looks_like_header(r):
+    # donut chart above the table: Fees + IC/PF + Service Charges = total, laid out left to right
+    if "brands" not in ctx:
+        ctx.setdefault("donut", []).extend((x, money(v)) for x, v in r.cells if is_money(v))
+        if len(ctx["donut"]) == 4:
+            vals = [v for _, v in sorted(ctx["donut"])]
+            st.totals["fee_summary_headline"] = dict(zip(["Fees", "Interchange Charges", "Service Charges",
+                                                          "Total"], vals))
         return True
-    return False
+    return looks_like_header(r)
 
 
 FEE_DETAIL_PATTERNS = [
@@ -458,6 +466,9 @@ def parse(pdf_path: str | Path) -> Statement:
     section, ctx, ctx_stats = None, {}, {}
     for pno, page in enumerate(doc, start=1):
         rows = page_rows(page, pno, stats=ctx_stats)
+        for r in rows:
+            for t in r.texts:
+                ctx_stats.setdefault("pdf_money", []).extend(money(m) for m in re.findall(r"-?\$[\d,]+\.\d{2}", t))
         if pno == 1:
             parse_header(page, rows, st)
         for r in rows:
@@ -475,6 +486,7 @@ def parse(pdf_path: str | Path) -> Statement:
                 st.unparsed.append({"page": r.page, "section": section, "text": " | ".join(r.texts)})
     st.info["pdf_pages"] = len(doc)
     validate(st)
+    coverage_check(st, ctx_stats.get("pdf_money", []))
     if hidden := ctx_stats.get("hidden_chars"):
         st.checks.append({"check": "Text hidden under shapes (masked / redacted areas)", "expected": None,
                           "actual": sum(hidden.values()), "difference": None, "status": "REVIEW",
@@ -491,6 +503,39 @@ def parse(pdf_path: str | Path) -> Statement:
 
 
 # --------------------------------------------------------------------------- reconciliation
+
+def coverage_check(st: Statement, pdf_money: list[Decimal]) -> None:
+    """Every dollar amount visible in the PDF must appear somewhere in the parsed output."""
+    from collections import Counter
+    out: Counter = Counter()
+
+    def walk(v):
+        if isinstance(v, dict):
+            for k, x in v.items():
+                if k not in DERIVED_FIELDS:
+                    walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+        elif isinstance(v, Decimal):
+            out[v] += 1
+    for name in Statement.TABLES:
+        walk(getattr(st, name))
+    walk(st.account_summary)
+    walk(st.totals)
+    for f in st.fees:                         # amounts quoted inside fee descriptions
+        for m in re.findall(r"\$[\d,]+\.\d{2}", f["description"]):
+            out[money(m)] += 1
+    missing = Counter(pdf_money) - out
+    n = sum(missing.values())
+    st.checks.insert(0, {"check": "Coverage: every dollar amount printed in the PDF is in the output",
+                         "expected": len(pdf_money), "actual": len(pdf_money) - n, "difference": -n,
+                         "status": "OK" if n == 0 else "MISMATCH",
+                         "note": ", ".join(f"{k} (x{v})" for k, v in missing.most_common(10))})
+
+
+DERIVED_FIELDS = {"recalculated_charges", "recalc_difference"}
+
 
 def validate(st: Statement) -> None:
     def check(name, expected, actual, note=""):
@@ -551,6 +596,9 @@ def validate(st: Statement) -> None:
     check("Paid by Others detail matches Summary by Location per location (mismatching)", 0, len(bad), ", ".join(bad))
     check("Disputes: sum of detail = printed Total", T.get("disputes"), S(st.disputes, "amount"))
     check("Disputes Total = Account Summary", a.get("disputes"), T.get("disputes"))
+    if b := T.get("disputes_banner"):
+        check("Disputes banner: credits + debits = net", b["net"], b["credits"] + b["debits"])
+        check("Disputes banner net = Disputes Total", T.get("disputes"), b["net"])
 
     # Fees
     check("Fee detail: sum of all fee lines = Account Summary fees", a.get("fees"), S(st.fees, "amount"))
@@ -560,6 +608,9 @@ def validate(st: Statement) -> None:
               S(st.fees, "amount", fee_type=ftype))
     if "fee_summary" in T:
         check("Fee Summary grand total = Account Summary fees", a.get("fees"), T["fee_summary"].get("Total"))
+    for k, v in T.get("fee_summary_headline", {}).items():
+        row = fs.get(k, {}).get("Total") if k != "Total" else T.get("fee_summary", {}).get("Total")
+        check(f"Fee Summary chart '{k}' = Fee Summary table", row, v)
     # printed category subtotals (a category may continue across pages; subtotal follows its last row)
     running, i = Decimal(0), 0
     for f in st.fees:
@@ -596,7 +647,8 @@ def validate(st: Statement) -> None:
         r["recalc_difference"] = (r["total_charges"] - r["recalculated_charges"])
     bad = [r for r in st.interchange if r["total_charges"] and abs(r["recalc_difference"]) > Decimal("1")]
     if bad:
-        flag("Interchange lines that don't recompute from printed rate (> $1)",
+        flag("Interchange lines that don't recompute from printed rate (> $1): possible blended rate / "
+             "downgrade, worth confirming with the processor",
              "; ".join(f"{r['card_brand']} {r['product_description']} (p{r['page']}): printed {r['total_charges']}, "
                        f"sales x rate + items x per-item = {r['recalculated_charges']}" for r in bad))
     if "Interchange Charges" in fs and ic:
@@ -636,12 +688,24 @@ def validate(st: Statement) -> None:
     ps, pe = st.info.get("period_start"), st.info.get("period_end")
     out = [d["date"] for d in st.daily if re.match(r"\d{4}-", d["date"]) and ps and not (ps <= d["date"] <= pe)]
     if out:
-        flag("Summary by Day dates outside statement period", ", ".join(out)
-             + " (batches submitted before the period but posted inside it)")
+        funded: dict = {}
+        for r in st.amounts_funded:
+            if r["amount_submitted"]:                  # the sales batch, not the fee-collection line
+                funded.setdefault(r["date_submitted"], r["date_funded"])
+        flag("Summary by Day includes dates before the statement period",
+             "; ".join(f"{d} (funded {funded.get(d, '?')})" for d in out)
+             + ": batches submitted on the last day of the prior period and funded inside this period. "
+               "Expected Fiserv behaviour; kept as printed.", "INFO")
     if st.sales_trend and pe:
         last = st.sales_trend[-1]
         if last["month"] == pe[:7]:
             check("13-month trend current month = amount submitted", a.get("amount_submitted"), last["amount_submitted"])
+        for key, back in [("year_over_year_change", 12), ("month_over_month_change", 1)]:
+            if key in st.info and len(st.sales_trend) > back:
+                printed = Decimal(st.info[key].split(": ")[1].rstrip("%"))
+                prev = st.sales_trend[-1 - back]["amount_submitted"]
+                calc = ((last["amount_submitted"] / prev - 1) * 100).quantize(Decimal("0.01"))
+                check(f"{key.replace('_', ' ').capitalize()} % recomputed from 13-month trend", printed, calc)
     check("Fee category subtotals add up to Account Summary fees", a.get("fees"),
           S(st.fee_category_totals, "printed_total"))
     if st.unparsed:
@@ -650,10 +714,94 @@ def validate(st: Statement) -> None:
 
 # --------------------------------------------------------------------------- output
 
+def as_date(v):
+    if isinstance(v, str) and re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+        return date.fromisoformat(v)
+    return v
+
+
 def _plain(v):
     if isinstance(v, Decimal):
         return float(v)
     return v
+
+
+def build_summary(st: Statement) -> list[dict]:
+    """Headline KPIs an analyst reads first: volume, fees, effective rates, pass-through vs markup."""
+    a, T, D = st.account_summary, st.totals, Decimal
+    ct, fs = T.get("card_type", {}), {r["fee_type"]: r for r in st.fee_summary}
+    rows = []
+
+    def add(section, metric, value, kind="money", note=""):
+        rows.append({"section": section, "metric": metric, "value": value, "_kind": kind, "note": note})
+
+    i = st.info
+    add("Statement", "Statement period", f"{i.get('period_start')} to {i.get('period_end')}", "text")
+    add("Statement", "Merchant (as visible on statement)", i.get("merchant_name"), "text")
+    add("Statement", "Corporate number (as visible)", i.get("corporate_number"), "text",
+        "partly masked on the PDF" if len(str(i.get("corporate_number", ""))) < 10 else "")
+    add("Statement", "Locations (MIDs)", len(st.location), "int")
+    if ct:
+        add("Volume", "Gross sales", ct["gross_amount"])
+        add("Volume", "Refunds", ct["refund_amount"])
+        add("Volume", "Amount submitted (net)", a.get("amount_submitted"))
+        add("Volume", "Transactions (sales + refunds)", ct["net_items"], "int")
+        add("Volume", "Average ticket", (a["amount_submitted"] / ct["net_items"]).quantize(D("0.01")))
+        add("Volume", "Refund rate (by amount)", -ct["refund_amount"] / ct["gross_amount"], "pct")
+    add("Settlement", "Paid by Others (AMEX, funded directly by American Express)", a.get("paid_by_others"))
+    add("Settlement", "Disputes / chargebacks", a.get("disputes"))
+    add("Settlement", "Adjustments", a.get("adjustments"))
+    add("Settlement", "Fees (this statement)", a.get("fees"))
+    add("Settlement", "Amount processed", a.get("amount_processed"))
+    if af := T.get("amounts_funded"):
+        add("Settlement", "Amount funded to bank", af.get("amount_funded"),
+            note=f"includes prior-period fees collected ({af.get('fees')})")
+    if a.get("fees") is not None and a.get("amount_submitted"):
+        fees = -a["fees"]
+        add("Cost", "Total fees", fees)
+        add("Cost", "Effective rate (fees / amount submitted)", fees / a["amount_submitted"], "pct")
+        amex = next((c for c in st.card_type if "AMERICAN" in c["card_type"]), None)
+        amex_fee = -sum((fs.get(k, {}).get("Amex", D(0)) for k in fs), D(0))
+        base = None
+        if amex:
+            base = a["amount_submitted"] - amex["net_amount"]
+            add("Cost", "Effective rate excl. AMEX volume (AMEX is priced by American Express)",
+                (fees - amex_fee) / base, "pct", f"on {base:,.2f} of Visa / MC / Discover / Debit volume")
+        if {"Interchange Charges", "Fees", "Service Charges"} <= fs.keys():
+            ic = -fs["Interchange Charges"]["Total"]
+            markup = -(fs["Fees"]["Total"] + fs["Service Charges"]["Total"])
+            add("Cost", "Pass-through: interchange + card-brand assessments", ic, note=f"{ic / fees:.1%} of fees")
+            add("Cost", "Processor fees + service charges (markup)", markup, note=f"{markup / fees:.1%} of fees")
+            if base:
+                add("Cost", "Markup as % of non-AMEX volume", markup / base, "pct")
+    by_brand = {c["card_type"]: c for c in st.card_type}
+    brand_map = {"Visa": "VISA", "Mastercard": "MASTERCARD", "Discover": "DISCOVER", "Debit": "DEBIT CARD",
+                 "Amex": "AMERICAN EXPRESS"}
+    for b, name in brand_map.items():
+        tot = T.get("fee_summary", {}).get(b)
+        if tot is not None and name in by_brand and by_brand[name]["net_amount"]:
+            add("Effective rate by card brand", f"{b}: fees {-tot:,.2f} on {by_brand[name]['net_amount']:,.2f}",
+                -tot / by_brand[name]["net_amount"], "pct")
+    agg: dict = {}
+    for f in st.fees:
+        if f["fee_type"] != "Interchange Charges":
+            key = re.split(r"\s+(?=[$\d.])", f["description"])[0].strip()   # drop volumes / counts / rates
+            agg[key] = agg.get(key, D(0)) - f["amount"]
+    for k, v in sorted(agg.items(), key=lambda kv: -kv[1])[:10]:
+        add("Largest non-interchange fees", k, v)
+    counts = {s_: sum(c["status"] == s_ for c in st.checks) for s_ in ["OK", "MISMATCH", "MISSING", "REVIEW", "INFO"]}
+    add("Data quality", "Validation checks", ", ".join(f"{k} {v}" for k, v in counts.items() if v), "text",
+        "details on the Validation sheet")
+    return rows
+
+
+HEADER_LABELS = {"pct_of_sales": "% of Sales", "pct_of_transactions": "% of Transactions",
+                 "rate_pct": "Rate (%)", "card_last4": "Card Last 4", "reference_no": "Reference No.",
+                 "recalc_difference": "Printed - Recalculated", "per_item_fee": "Per Item Fee"}
+
+
+def label(col: str) -> str:
+    return HEADER_LABELS.get(col, col.replace("_", " ").title() if col.islower() else col)
 
 
 def write_excel(st: Statement, path: Path) -> None:
@@ -671,29 +819,31 @@ def write_excel(st: Statement, path: Path) -> None:
         if not rows:
             ws.append(["(no rows)"])
             return ws
-        cols = list(dict.fromkeys(k for r in rows for k in r))
-        ws.append(cols)
+        cols = [k for k in dict.fromkeys(k for r in rows for k in r) if not k.startswith("_")]
+        ws.append([label(c) for c in cols])
         for c in ws[1]:
             c.font, c.fill = Font(bold=True, color="FFFFFF"), head_fill
             c.alignment = Alignment(wrap_text=True, vertical="top")
         for r in rows:
-            ws.append([_plain(r.get(c)) for c in cols])
+            ws.append([as_date(_plain(r.get(c))) for c in cols])
         for i, c in enumerate(cols, start=1):
             letter = get_column_letter(i)
             width = max(len(str(c)), *(len(str(_plain(r.get(c, "")))) for r in rows))
             ws.column_dimensions[letter].width = min(max(10, width + 2), 70)
             fmt = ("#,##0.00;[Red]-#,##0.00" if c in money_cols else "0.00%" if c in pct_cols else None)
-            if fmt:
-                for cell in ws[letter][1:]:
+            for cell in ws[letter][1:]:
+                if fmt:
                     cell.number_format = fmt
+                elif isinstance(cell.value, date):
+                    cell.number_format = "mm/dd/yyyy"
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
         return ws
 
     M = {"amount_submitted", "paid_by_others", "disputes", "adjustments", "fees", "amount_processed",
          "amount", "average_ticket", "gross_amount", "refund_amount", "net_amount", "sales_total",
-         "per_item_fee", "total_charges", "amount_funded", "printed_total", "basis_amount", "expected",
-         "actual", "difference", "Visa", "Mastercard", "Amex", "Discover", "Debit", "Others", "Total"}
+         "per_item_fee", "total_charges", "amount_funded", "printed_total", "basis_amount",
+         "recalculated_charges", "recalc_difference", "Visa", "Mastercard", "Amex", "Discover", "Debit", "Others", "Total"}
 
     ws = sheet("Validation", st.checks, M)
     for row in ws.iter_rows(min_row=2):
@@ -702,6 +852,14 @@ def write_excel(st: Statement, path: Path) -> None:
             for c in row:
                 c.fill = PatternFill("solid", fgColor=fills[status])
     ws.column_dimensions["A"].width = 70
+
+    summary = build_summary(st)
+    ws = sheet("Summary", summary)
+    for cell, r in zip(ws["C"][1:], summary):
+        cell.number_format = {"money": "#,##0.00;[Red]-#,##0.00", "pct": "0.00%", "int": "#,##0"}.get(r["_kind"], "General")
+        cell.alignment = Alignment(horizontal="right")
+    for col, w in zip("ABCD", (28, 75, 22, 55)):
+        ws.column_dimensions[col].width = w
     ws.column_dimensions["F"].width = 90
 
     info = [{"field": k, "value": _plain(v)} for k, v in st.info.items()]
@@ -721,7 +879,8 @@ def write_excel(st: Statement, path: Path) -> None:
     sheet("Amounts_Funded", st.amounts_funded, M)
     sheet("Sales_Trend_13M", st.sales_trend, M)
     sheet("Unparsed", st.unparsed)
-    wb.move_sheet("Validation", offset=1)  # Statement_Info first, then the checks, then the data
+    for pos, name in enumerate(["Summary", "Statement_Info", "Validation"]):   # then the data sheets
+        wb.move_sheet(name, offset=pos - wb.sheetnames.index(name))
     wb.save(path)
 
 
